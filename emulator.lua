@@ -99,7 +99,6 @@ end
 ---@param from register
 ---@param to register
 local function t(from, to)
-  print(("Transfer from %s to %s"):format(from, to))
   local getVal = function() return popStack() end
   local setVal = function(val) return pushStack(val) end
   if from == "a" then
@@ -119,7 +118,7 @@ local function t(from, to)
   end
 
   local val = getVal()
-  print(("New val: %x"):format(val))
+  print(("Transfer from %s to %s (set to %x)"):format(from, to, val))
   setVal(val)
 end
 
@@ -132,16 +131,20 @@ local function ld(reg, mode)
     local byte = getByte()
     val = byte
   end
+
+  local setVal = nil
   if reg == "a" then
-    print(("Set accumulator: %x"):format(emu.acc))
-    emu.acc = val
+    setVal = function(v) emu.acc = v end
   elseif reg == "x" then
-    print(("Set Rx: %x"):format(emu.acc))
-    emu.irx = val
-  else
-    print(("Set Ry: %x"):format(emu.acc))
-    emu.iry = val
+    setVal = function(v) emu.irx = v end
+  elseif reg == "y" then
+    setVal = function(v) emu.iry = v end
   end
+  if setVal == nil then
+    error("Invalid register 's' for LD")
+  end
+  setVal(val)
+  print(("Set R%s to %x"):format(reg, val))
 end
 
 ---@param mode addressMode
