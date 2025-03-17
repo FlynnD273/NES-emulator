@@ -19,12 +19,17 @@ end
 
 function love.load()
   emu.init()
-  emu.loadCart("./testdata/run.6502.nes")
+  emu.loadCart("./testdata/nestest.nes")
+  emu.dumpMem("emu.bin")
   Scale = 0.5
   RenderDimensions = { w = 256, h = 240 }
   WindowDimensions = { w = RenderDimensions.w * Scale, h = RenderDimensions.h * Scale }
 
   love.window.setMode(WindowDimensions.w, WindowDimensions.h, { resizable = true })
+end
+
+function love.update()
+  emu.processCurrentOp()
 end
 
 function love.draw()

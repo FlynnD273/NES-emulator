@@ -2,6 +2,11 @@ bit = bit
 emu = {}
 local k = 1024
 
+---@alias register
+---| "a"
+---| "x"
+---| "y"
+---| "s"
 ---@alias addressMode
 ---| "accumulator"
 ---| "absolute"
@@ -17,47 +22,30 @@ local k = 1024
 ---| "zeropagex"
 ---| "zeropagey"
 
-
 function emu.init()
-  emu.currentOp = nil
   emu.maxAddr = 64 * k
   emu.mem = string.rep(string.char(0), emu.maxAddr)
   emu.pc = 0
-  emu.sc = 0x01FF
+  emu.sp = 0xFF
   emu.acc = 0
   emu.irx = 0
   emu.iry = 0
-  emu.status = {
+  emu.flags = {
     carry = false,
     zero = false,
     interruptDisable = false,
-    -- Not needed in NES
-    -- decimalMode = false,
+    decimalMode = false,
     brk = false,
     overflow = false,
     negative = false
   }
 end
 
----@param mode addressMode
-local function lda(mode)
-  print("LDA " .. mode)
-end
-
-local opTable = {}
-opTable[0xa9] = function() lda("immediate") end
-opTable[0xa5] = function() lda("zeropage") end
-opTable[0xb5] = function() lda("zeropagex") end
-opTable[0xad] = function() lda("absolute") end
-opTable[0xbd] = function() lda("absolutex") end
-opTable[0xb9] = function() lda("absolutey") end
-opTable[0xa1] = function() lda("indirectx") end
-opTable[0xb1] = function() lda("indirecty") end
-
 ---@param addr number?
 local function getByte(addr)
   if addr == nil then
     addr = emu.pc
+    emu.pc = emu.pc + 1
   end
   addr = addr + 1
   return string.byte(emu.mem, addr)
@@ -92,19 +80,140 @@ local function setByteString(val, addr)
   elseif addr + val:len() == emu.maxAddr then
     emu.mem = emu.mem:sub(1, addr - 1) .. val
   else
-    emu.mem = emu.mem:sub(1, addr - 1) .. val .. emu.mem:sub(addr + val:len())
+    emu.mem = emu.mem:sub(1, addr - 1) .. val .. emu.mem:sub(addr + val:len() + 1)
   end
 end
 
-function emu.cycle()
-  if emu.currentOp == nil then
-    local op = getByte()
-    local opFunc = opTable[op]
-    if opFunc == nil then
-      emu.pc = emu.pc + 1
+local function popStack()
+  local val = getByte(0x0100 + emu.sp)
+  emu.sp = emu.sp + 1
+  return val
+end
+
+---@param val number
+local function pushStack(val)
+  setByte(val, 0x0100 + emu.sp)
+  emu.sp = emu.sp - 1
+end
+
+---@param from register
+---@param to register
+local function t(from, to)
+  print(("Transfer from %s to %s"):format(from, to))
+  local getVal = function() return popStack() end
+  local setVal = function(val) return pushStack(val) end
+  if from == "a" then
+    getVal = function() return emu.acc end
+  elseif from == "x" then
+    getVal = function() return emu.irx end
+  elseif from == "y" then
+    getVal = function() return emu.iry end
+  end
+
+  if to == "a" then
+    setVal = function(val) emu.acc = val end
+  elseif to == "x" then
+    setVal = function(val) emu.irx = val end
+  elseif to == "y" then
+    setVal = function(val) emu.iry = val end
+  end
+
+  local val = getVal()
+  print(("New val: %x"):format(val))
+  setVal(val)
+end
+
+---@param reg register
+---@param mode addressMode
+local function ld(reg, mode)
+  print("LDA " .. mode)
+  local val = 0
+  if mode == "immediate" then
+    local byte = getByte()
+    val = byte
+  end
+  if reg == "a" then
+    print(("Set accumulator: %x"):format(emu.acc))
+    emu.acc = val
+  elseif reg == "x" then
+    print(("Set Rx: %x"):format(emu.acc))
+    emu.irx = val
+  else
+    print(("Set Ry: %x"):format(emu.acc))
+    emu.iry = val
+  end
+end
+
+---@param mode addressMode
+local function cmp(mode)
+  print("CMP " .. mode)
+  if mode == "immediate" then
+    local byte = getByte()
+    emu.flags.carry = emu.acc >= byte
+    emu.flags.zero = emu.acc == byte
+    emu.flags.negative = emu.acc < byte
+  end
+end
+
+---@param mode addressMode
+local function beq(mode)
+  print("BEQ " .. mode)
+  if mode == "relative" then
+    local byte = getByte()
+    if emu.flags.zero then
+      emu.pc = emu.pc + byte
+      print(("Jump to: %x"):format(emu.pc))
     else
-      opFunc()
+      print("No jump")
     end
+  end
+end
+
+local function sei()
+  print("SEI")
+  emu.flags.interruptDisable = true
+end
+
+local function cld()
+  print("CLD")
+  emu.flags.decimalMode = false
+end
+
+local function rti()
+  print("RTI")
+  print("TODO: Handle the stack")
+end
+
+local opTable = {}
+opTable[0x9a] = function() t("x", "s") end
+
+opTable[0xa2] = function() ld("x", "immediate") end
+
+opTable[0xa9] = function() ld("a", "immediate") end
+opTable[0xa5] = function() ld("a", "zeropage") end
+opTable[0xb5] = function() ld("a", "zeropagex") end
+opTable[0xad] = function() ld("a", "absolute") end
+opTable[0xbd] = function() ld("a", "absolutex") end
+opTable[0xb9] = function() ld("a", "absolutey") end
+opTable[0xa1] = function() ld("a", "indirectx") end
+opTable[0xb1] = function() ld("a", "indirecty") end
+
+opTable[0xf0] = function() beq("relative") end
+
+opTable[0xc9] = function() cmp("immediate") end
+
+opTable[0x40] = function() rti() end
+opTable[0x78] = function() sei() end
+opTable[0xd8] = function() cld() end
+
+function emu.processCurrentOp()
+  local op = getByte()
+  local opFunc = opTable[op]
+  if opFunc == nil then
+    error(("Opcode $%x not implemented"):format(op))
+    emu.pc = emu.pc + 1
+  else
+    opFunc()
   end
 end
 
@@ -132,17 +241,15 @@ function emu.loadCart(path)
   local chrRomSize = string.byte(cart, idx) * 8 * k
   idx = idx + 1
   local mapperMode = string.byte(cart, idx)
-  idx = 16
+  idx = 17
   local prg = string.sub(cart, idx, idx + prgRomSize - 1)
-  print(("prog size: %x"):format(prgRomSize))
   idx = idx + prgRomSize
-  print(("chr start: %x"):format(idx))
   local chr = string.sub(cart, idx, idx + chrRomSize - 1)
   if mapperMode == 0 then
     if prg:len() == 16 * k then
       print("16k")
       setByteString(prg, 0x8000)
-      setByteString(prg, 0x8000 + 16 * k)
+      setByteString(prg, 0xC000)
     else
       print("32k")
       setByteString(prg, 0x8000)
@@ -151,16 +258,21 @@ function emu.loadCart(path)
     error(("Unsupported mapper mode %x"):format(mapperMode))
   end
   emu.resetVectors = {
-    nmi = bit.band(getByte(0xFFFB), bit.lshift(getByte(0xFFFA), 8)),
-    reset = bit.band(getByte(0xFFFD), bit.lshift(getByte(0xFFFC), 8)),
+    nmi = bit.bor(getByte(0xFFFA), bit.lshift(getByte(0xFFFB), 8)),
+    reset = bit.bor(getByte(0xFFFC), bit.lshift(getByte(0xFFFD), 8)),
     irq = getByte(0xFFFE),
     brk = getByte(0xFFFF),
   }
   emu.pc = emu.resetVectors.reset
   print(string.format("Starting program counter at address %x", emu.pc))
-  print(string.format("mem size: %x", emu.mem:len()))
-  print(("last mem: %x"):format(getByte(0xFFFe)))
-  file = io.open("mem.bin", "wb")
+end
+
+---@param path string
+function emu.dumpMem(path)
+  local file = io.open(path, "wb")
+  if file == nil then
+    return
+  end
   file:write(emu.mem)
   file:close()
 end
