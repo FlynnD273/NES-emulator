@@ -29,7 +29,7 @@ function love.load()
 end
 
 function love.update()
-  emu.processCurrentOp()
+  emu.tick()
 end
 
 function love.draw()

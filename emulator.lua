@@ -27,6 +27,7 @@ local k = 1024
 function emu.init()
   emu.maxAddr = 64 * k
   emu.mem = string.rep(string.char(0), emu.maxAddr)
+  emu.vram = string.rep(string.char(0), 0x4000)
   emu.pc = 0
   emu.sc = 0xFF
   emu.acc = 0
@@ -41,24 +42,21 @@ function emu.init()
     overflow = false,
     negative = false
   }
+  emu.ppu = {
+    rv = 0,
+    rt = 0,
+    rx = 0,
+    flags = {
+      rw = false,
+      odd = false,
+      rendering = false,
+    }
+  }
 end
 
----@param addr number?
-local function getByte(addr)
-  if addr == nil then
-    addr = emu.pc
-    emu.pc = emu.pc + 1
-  end
-  addr = addr + 1
-  return string.byte(emu.mem, addr)
-end
-
----@param val string|number
----@param addr number?
-local function setByte(val, addr)
-  if type(val) == "number" then
-    val = string.char(val)
-  end
+---@param val string
+---@param addr number
+local function writeByteInternal(val, addr)
   addr = addr + 1
   if addr == 1 then
     emu.mem = val .. emu.mem:sub(1 + val:len())
@@ -67,6 +65,98 @@ local function setByte(val, addr)
   else
     emu.mem = emu.mem:sub(1, addr - 1) .. val .. emu.mem:sub(addr + val:len())
   end
+end
+
+local function yInc()
+  if bit.band(emu.ppu.rv, 0x7000) ~= 0x7000 then
+    emu.ppu.rv = emu.ppu.rv + 0x1000
+  else
+    emu.ppu.rv = bit.band(emu.ppu.rv, bit.bnot(0x7000))
+    local y = bit.rshift(bit.band(emu.ppu.rv, 0x03E0), 5)
+    if y == 29 then
+      y = 0
+      emu.ppu.rv = bit.bxor(emu.ppu.rv, 0x0800)
+    elseif y == 31 then
+      y = 0
+    else
+      y = y + 1
+    end
+    emu.ppu.rv = bit.bor(bit.band(emu.ppu.rv, bit.bnot(bit.bnot(0x03E0))), bit.lshift(y, 5))
+  end
+end
+
+local function xCoarseInc()
+  if bit.band(emu.ppu.rv, 0x001F) == 31 then
+    emu.ppu.rv = bit.band(emu.ppu.rv, bit.bnot(0x001F))
+    emu.ppu.rv = bit.bxor(emu.ppu.rv, 0x0400)
+  else
+    emu.ppu.rv = emu.ppu.rv + 1
+  end
+end
+
+local tmpscanline = 0
+local tmppputickcount = 0
+local function pputick()
+  if tmpscanline == 0 and tmppputickcount == 0 then
+    print("VBLANK")
+    writeByteInternal(string.char(0x80), 0x2002)
+  end
+  tmppputickcount = tmppputickcount + 1
+  if tmpscanline == 262 then
+    tmpscanline = 0
+  end
+  if tmppputickcount == 341 then
+    tmppputickcount = 0
+    tmpscanline = tmpscanline + 1
+  end
+  -- xCoarseInc()
+  -- yInc()
+end
+
+local function readByteSideEffects(addr)
+  if addr == 0x2002 then
+    emu.ppu.rw = false
+  end
+end
+
+---@param addr number?
+local function getByte(addr)
+  if addr == nil then
+    addr = emu.pc
+    emu.pc = emu.pc + 1
+  end
+  if not emu.ppu.flags.rendering and addr >= 0x2000 and addr <= 0x3fff then
+    addr = (addr % 8) + 0x2000
+  end
+  for i = 1, 3, 1 do
+    pputick()
+  end
+  local ret = string.byte(emu.mem, addr + 1)
+  readByteSideEffects(addr)
+  return ret
+end
+
+local function writeByteSideEffects(addr)
+  if addr == 0x2005 or addr == 0x2006 then
+    emu.ppu.flags.rw = not emu.ppu.flags.rw
+  end
+end
+
+
+---@param val string|number
+---@param addr number
+local function writeByte(val, addr)
+  if type(val) == "number" then
+    val = string.char(val)
+  end
+  if addr >= 0x2000 and addr <= 0x3fff then
+    addr = (addr % 8) + 0x2000
+  end
+  for i = 1, 3, 1 do
+    pputick()
+  end
+  writeByteInternal(val, addr)
+  writeByteSideEffects(addr)
 end
 
 ---@param addr number
@@ -89,7 +179,7 @@ local function pushStack(val)
       val = 0
     end
   end
-  setByte(val, 0x0100 + emu.sc)
+  writeByte(val, 0x0100 + emu.sc)
   emu.sc = emu.sc - 1
 end
 
@@ -153,6 +243,59 @@ local function t(from, to)
   setVal(val)
 end
 
+---@param mode addressMode
+local function st(reg, mode)
+  local addr = 0
+  if mode == "absolute" then
+    local low = getByte()
+    local high = getByte()
+    addr = getByte(bytesToInt16(low, high))
+  else
+    error(("st%s with mode %s is not implemented"):format(reg, mode))
+  end
+
+  local getVal = nil
+  if reg == "a" then
+    getVal = function() return emu.acc end
+  elseif reg == "x" then
+    getVal = function() return emu.irx end
+  elseif reg == "y" then
+    getVal = function() return emu.iry end
+  end
+  if getVal == nil then
+    error("Invalid register 's' for LD")
+  end
+  local val = getVal()
+  emu.flags.zero = val == 0
+  emu.flags.negative = bit.band(val, 0x80) ~= 0
+  writeByte(val, addr)
+  print(("st%s %s set r%s to 0x%x"):format(reg, mode, reg, val))
+end
+
+---@param reg register
+local function inc(reg)
+  if reg == "a" then
+    emu.acc = emu.acc + 1
+  elseif reg == "x" then
+    emu.irx = emu.irx + 1
+  elseif reg == "y" then
+    emu.iry = emu.iry + 1
+  end
+  print(("in%s"):format(reg))
+end
+
+---@param reg register
+local function de(reg)
+  if reg == "a" then
+    emu.acc = emu.acc - 1
+  elseif reg == "x" then
+    emu.irx = emu.irx - 1
+  elseif reg == "y" then
+    emu.iry = emu.iry - 1
+  end
+  print(("de%s"):format(reg))
+end
+
 ---@param reg register
 ---@param mode addressMode
 local function ld(reg, mode)
@@ -163,36 +306,57 @@ local function ld(reg, mode)
     local low = getByte()
     local high = getByte()
     val = getByte(bytesToInt16(low, high))
+  elseif mode == "absolutex" then
+    local low = getByte()
+    local high = getByte()
+    val = getByte(bytesToInt16(low, high)) + emu.irx
   else
     error(("ld%s with mode %s is not implemented"):format(reg, mode))
   end
 
-  local setVal = nil
-  if reg == "a" then
-    setVal = function(v) emu.acc = v end
-  elseif reg == "x" then
-    setVal = function(v) emu.irx = v end
-  elseif reg == "y" then
-    setVal = function(v) emu.iry = v end
-  end
-  if setVal == nil then
-    error("Invalid register 's' for LD")
-  end
-  setVal(val)
+  local setVal = {
+    a = function(v) emu.acc = v end,
+    x = function(v) emu.irx = v end,
+    y = function(v) emu.iry = v end,
+  }
+  setVal[reg](val)
   emu.flags.zero = val == 0
-  emu.flags.negative = val < 0
+  emu.flags.negative = bit.band(val, 0x80) ~= 0
   print(("ld%s %s set r%s to 0x%x"):format(reg, mode, reg, val))
 end
 
+---@param reg register
 ---@param mode addressMode
-local function cmp(mode)
-  print("CMP " .. mode)
+local function cp(reg, mode)
+  print(("cm%s %s"):format(reg, mode))
+  local val
   if mode == "immediate" then
-    local byte = getByte()
-    emu.flags.carry = emu.acc >= byte
-    emu.flags.zero = emu.acc == byte
-    emu.flags.negative = emu.acc < byte
+    val = getByte()
   end
+  local comp = {
+    a = emu.acc,
+    x = emu.irx,
+    y = emu.iry,
+  }
+  emu.flags.carry = comp[reg] >= val
+  emu.flags.zero = comp[reg] == val
+  emu.flags.negative = comp[reg] < val
+end
+
+local function rts()
+  print("RTS")
+  popPC()
+  emu.pc = emu.pc + 1
+end
+
+
+local function jsr()
+  print("JSR")
+  local low = getByte()
+  local high = getByte()
+  emu.pc = emu.pc - 1
+  pushPC()
+  emu.pc = bytesToInt16(low, high)
 end
 
 ---@param mode addressMode
@@ -212,17 +376,16 @@ local function jmp(mode)
   end
 end
 
----@param mode "eq"|"pl"
+---@param mode "eq"|"pl"|"ne"
 local function b(mode)
   local byte = uintToInt(getByte())
-  local shouldJump = false
-  if mode == "eq" then
-    shouldJump = emu.flags.zero
-  elseif mode == "pl" then
-    shouldJump = not emu.flags.negative
-  end
+  local shouldJump = {
+    eq = emu.flags.zero,
+    ne = not emu.flags.zero,
+    pl = not emu.flags.negative,
+  }
   local jumpStatus = ""
-  if shouldJump then
+  if shouldJump[mode] then
     emu.pc = emu.pc + byte
     jumpStatus = ("jump by %d to: %x"):format(byte, emu.pc)
   else
@@ -257,33 +420,38 @@ local function rti()
 end
 
 local opTable = {}
-opTable[0x9a] = function() t("x", "s") end
 
-opTable[0xa2] = function() ld("x", "immediate") end
-
-opTable[0xa9] = function() ld("a", "immediate") end
-opTable[0xa5] = function() ld("a", "zeropage") end
-opTable[0xb5] = function() ld("a", "zeropagex") end
-opTable[0xad] = function() ld("a", "absolute") end
-opTable[0xbd] = function() ld("a", "absolutex") end
-opTable[0xb9] = function() ld("a", "absolutey") end
-opTable[0xa1] = function() ld("a", "indirectx") end
-opTable[0xb1] = function() ld("a", "indirecty") end
-
-opTable[0xf0] = function() b("eq") end
-opTable[0x10] = function() b("pl") end
-
-opTable[0xc9] = function() cmp("immediate") end
-
-opTable[0x4c] = function() jmp("absolute") end
-opTable[0x6c] = function() jmp("indirect") end
-
-opTable[0x40] = function() rti() end
-opTable[0x78] = function() sei() end
-opTable[0xd8] = function() cld() end
+opTable[0xe8] = function() inc("x") end
+opTable[0xca] = function() de("x") end
+opTable[0x88] = function() de("y") end
 opTable[0x00] = function() brk() end
+opTable[0x10] = function() b("pl") end
+opTable[0xd0] = function() b("ne") end
+opTable[0x20] = function() jsr() end
+opTable[0x40] = function() rti() end
+opTable[0x4c] = function() jmp("absolute") end
+opTable[0x60] = function() rts() end
+opTable[0x6c] = function() jmp("indirect") end
+opTable[0x78] = function() sei() end
+opTable[0x8d] = function() st("a", "absolute") end
+opTable[0x8e] = function() st("x", "absolute") end
+opTable[0x9a] = function() t("x", "s") end
+opTable[0xa0] = function() ld("y", "immediate") end
+opTable[0xa1] = function() ld("a", "indirectx") end
+opTable[0xa2] = function() ld("x", "immediate") end
+opTable[0xa5] = function() ld("a", "zeropage") end
+opTable[0xa9] = function() ld("a", "immediate") end
+opTable[0xad] = function() ld("a", "absolute") end
+opTable[0xb1] = function() ld("a", "indirecty") end
+opTable[0xb5] = function() ld("a", "zeropagex") end
+opTable[0xb9] = function() ld("a", "absolutey") end
+opTable[0xbd] = function() ld("a", "absolutex") end
+opTable[0xc9] = function() cp("a", "immediate") end
+opTable[0xe0] = function() cp("x", "immediate") end
+opTable[0xd8] = function() cld() end
+opTable[0xf0] = function() b("eq") end
 
-function emu.processCurrentOp()
+function emu.tick()
   local op = getByte()
   print(("pc: %x (%x)"):format(emu.pc - 1, op))
   emu.dumpMem("emu.bin")
@@ -329,11 +497,11 @@ function emu.loadCart(path)
     if prg:len() == 16 * k then
       print("16k")
       print(("%x"):format(prg:byte(1)))
-      setByte(prg, 0x8000)
-      setByte(prg, 0xC000)
+      writeByte(prg, 0x8000)
+      writeByte(prg, 0xC000)
     else
       print("32k")
-      setByte(prg, 0x8000)
+      writeByte(prg, 0x8000)
     end
   else
     error(("Unsupported mapper mode %x"):format(mapperMode))
